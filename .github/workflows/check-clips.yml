@@ -2,9 +2,9 @@ name: JOTTA Clip Watcher
 
 on:
   schedule:
-    - cron: "30 19 * * *"
+    - cron: "28 18 * * *"
   workflow_dispatch:
-
+  
 permissions:
   contents: write
 
