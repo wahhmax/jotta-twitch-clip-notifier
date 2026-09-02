@@ -7,63 +7,97 @@ from datetime import datetime, timedelta, timezone
 import requests
 
 
+# ============================================================
+# CONFIGURAÇÃO
+# ============================================================
+
 TWITCH_API_BASE = "https://api.twitch.tv/helix"
 TWITCH_AUTH_URL = "https://id.twitch.tv/oauth2/token"
 
-CHANNEL_LOGIN = os.getenv("TWITCH_CHANNEL", "jotta")
+CHANNEL_LOGIN = "jotta"
 
 CLIENT_ID = os.getenv("TWITCH_CLIENT_ID")
 CLIENT_SECRET = os.getenv("TWITCH_CLIENT_SECRET")
-
-DISCORD_CLIP_WEBHOOK_URL = os.getenv("DISCORD_CLIP_WEBHOOK_URL")
+DISCORD_WEBHOOK = os.getenv("DISCORD_CLIP_WEBHOOK_URL")
 
 STATE_FILE = "data/state.json"
 
+# O GitHub executa a cada 10 minutos.
+# Procuramos 15 minutos para trás para compensar atrasos.
 LOOKBACK_MINUTES = 15
-DISCORD_RETRIES = 5
 
+# Número máximo de tentativas quando o Discord responde 429.
+MAX_DISCORD_RETRIES = 5
+
+
+# ============================================================
+# TEMPO
+# ============================================================
 
 def utc_now():
     return datetime.now(timezone.utc)
 
 
-def parse_datetime(value):
-    return datetime.fromisoformat(value.replace("Z", "+00:00"))
+def parse_twitch_time(value):
+    return datetime.fromisoformat(
+        value.replace("Z", "+00:00")
+    )
 
+
+# ============================================================
+# ESTADO
+# ============================================================
 
 def load_state():
+
     if not os.path.exists(STATE_FILE):
         return {
-            "seen_clips": [],
-            "last_status_at": None
+            "seen_clips": []
         }
 
     try:
+
         with open(STATE_FILE, "r", encoding="utf-8") as file:
             state = json.load(file)
 
-        state.setdefault("seen_clips", [])
-        state.setdefault("last_status_at", None)
+        if "seen_clips" not in state:
+            state["seen_clips"] = []
 
         return state
 
-    except Exception:
-        print("⚠️ Não foi possível ler o state.json. A iniciar estado novo.")
+    except Exception as error:
+
+        print(f"⚠️ Erro a ler state.json: {error}")
 
         return {
-            "seen_clips": [],
-            "last_status_at": None
+            "seen_clips": []
         }
 
 
 def save_state(state):
-    os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
 
-    with open(STATE_FILE, "w", encoding="utf-8") as file:
-        json.dump(state, file, indent=2, ensure_ascii=False)
+    os.makedirs("data", exist_ok=True)
+
+    with open(
+        STATE_FILE,
+        "w",
+        encoding="utf-8"
+    ) as file:
+
+        json.dump(
+            state,
+            file,
+            indent=2,
+            ensure_ascii=False
+        )
 
 
-def get_twitch_access_token():
+# ============================================================
+# TWITCH
+# ============================================================
+
+def get_access_token():
+
     response = requests.post(
         TWITCH_AUTH_URL,
         params={
@@ -75,39 +109,45 @@ def get_twitch_access_token():
     )
 
     if response.status_code != 200:
+
         raise RuntimeError(
-            f"Twitch OAuth falhou: HTTP {response.status_code}: {response.text}"
+            f"Erro ao obter token Twitch: "
+            f"HTTP {response.status_code} "
+            f"{response.text}"
         )
 
     return response.json()["access_token"]
 
 
-def twitch_request(endpoint, token, params=None):
-    headers = {
-        "Client-ID": CLIENT_ID,
-        "Authorization": f"Bearer {token}"
-    }
+def twitch_get(endpoint, token, params=None):
 
     response = requests.get(
         f"{TWITCH_API_BASE}/{endpoint}",
-        headers=headers,
+        headers={
+            "Client-ID": CLIENT_ID,
+            "Authorization": f"Bearer {token}"
+        },
         params=params,
         timeout=30
     )
 
     if response.status_code != 200:
+
         raise RuntimeError(
-            f"Twitch API falhou: HTTP {response.status_code}: {response.text}"
+            f"Twitch API erro: "
+            f"HTTP {response.status_code} "
+            f"{response.text}"
         )
 
     return response.json()
 
 
 def get_broadcaster_id(token):
-    data = twitch_request(
+
+    data = twitch_get(
         "users",
         token,
-        params={
+        {
             "login": CHANNEL_LOGIN
         }
     )
@@ -115,21 +155,29 @@ def get_broadcaster_id(token):
     users = data.get("data", [])
 
     if not users:
+
         raise RuntimeError(
-            f"O canal Twitch '{CHANNEL_LOGIN}' não foi encontrado."
+            f"O canal '{CHANNEL_LOGIN}' não foi encontrado."
         )
 
     return users[0]["id"]
 
 
-def get_recent_clips(token, broadcaster_id, cutoff):
-    clips = []
+def get_clips(token, broadcaster_id):
+
+    now = utc_now()
+
+    cutoff = now - timedelta(
+        minutes=LOOKBACK_MINUTES
+    )
+
+    all_clips = []
 
     cursor = None
 
-    # Até 5 páginas de 100 clips.
-    # Normalmente a primeira página será mais do que suficiente.
-    for _ in range(5):
+    # Faz até 5 páginas.
+    # Cada página pode ter até 100 clips.
+    for page_number in range(5):
 
         params = {
             "broadcaster_id": broadcaster_id,
@@ -139,276 +187,461 @@ def get_recent_clips(token, broadcaster_id, cutoff):
         if cursor:
             params["after"] = cursor
 
-        data = twitch_request(
+        data = twitch_get(
             "clips",
             token,
-            params=params
+            params
         )
 
-        page = data.get("data", [])
+        clips = data.get("data", [])
 
-        if not page:
+        if not clips:
             break
 
-        clips.extend(page)
+        all_clips.extend(clips)
 
-        # Os clips vêm dos mais recentes para os mais antigos.
-        oldest = min(
-            parse_datetime(clip["created_at"])
-            for clip in page
+        # Verifica o clip mais antigo desta página.
+        oldest_clip = min(
+            parse_twitch_time(
+                clip["created_at"]
+            )
+            for clip in clips
         )
 
-        if oldest < cutoff:
+        # Como os clips vêm dos mais recentes
+        # para os mais antigos, podemos parar.
+        if oldest_clip < cutoff:
             break
 
-        cursor = data.get("pagination", {}).get("cursor")
+        cursor = data.get(
+            "pagination",
+            {}
+        ).get("cursor")
 
         if not cursor:
             break
 
-    return clips
+    return all_clips, cutoff
 
 
-def send_discord(webhook_url, payload):
-    if not webhook_url:
-        raise RuntimeError("DISCORD_CLIP_WEBHOOK_URL não está configurado.")
+# ============================================================
+# DISCORD
+# ============================================================
 
-    for attempt in range(1, DISCORD_RETRIES + 1):
+def send_to_discord(clip):
+
+    if not DISCORD_WEBHOOK:
+
+        raise RuntimeError(
+            "DISCORD_CLIP_WEBHOOK_URL não configurado."
+        )
+
+    title = clip.get(
+        "title",
+        "Novo clip"
+    )
+
+    creator = clip.get(
+        "creator_name",
+        "Desconhecido"
+    )
+
+    views = clip.get(
+        "view_count",
+        0
+    )
+
+    clip_url = clip.get(
+        "url"
+    )
+
+    created_at = clip.get(
+        "created_at"
+    )
+
+    payload = {
+
+        "username": "JOTTA Clip Watcher",
+
+        "content": "🎬 **NOVO CLIP DO JOTTA**",
+
+        "embeds": [
+            {
+
+                "title": title,
+
+                "url": clip_url,
+
+                "description":
+                    f"📺 **Streamer:** {CHANNEL_LOGIN}\n"
+                    f"✂️ **Criado por:** {creator}\n"
+                    f"👁️ **Visualizações:** {views}\n"
+                    f"🕐 **Publicado:** {created_at}",
+
+                "footer": {
+                    "text": "JOTTA Clip Watcher"
+                }
+
+            }
+        ]
+    }
+
+    for attempt in range(
+        1,
+        MAX_DISCORD_RETRIES + 1
+    ):
 
         response = requests.post(
-            webhook_url,
+            DISCORD_WEBHOOK,
             json=payload,
             timeout=30
         )
 
+        # Discord aceitou
         if response.status_code in (200, 204):
+
             return True
 
+        # Rate limit
         if response.status_code == 429:
 
             retry_after = None
 
             try:
+
                 body = response.json()
-                retry_after = body.get("retry_after")
+
+                retry_after = body.get(
+                    "retry_after"
+                )
+
             except Exception:
                 pass
 
             if retry_after is None:
-                header = response.headers.get("Retry-After")
 
-                if header:
+                retry_header = response.headers.get(
+                    "Retry-After"
+                )
+
+                if retry_header:
+
                     try:
-                        retry_after = float(header)
+                        retry_after = float(
+                            retry_header
+                        )
                     except ValueError:
-                        retry_after = None
+                        pass
 
             if retry_after is None:
-                retry_after = min(2 ** attempt, 30)
+                retry_after = 2 ** attempt
 
-            retry_after = float(retry_after) + 0.5
+            retry_after = float(
+                retry_after
+            ) + 0.5
 
             print(
-                f"⚠️ Discord rate limit (429). "
-                f"Tentativa {attempt}/{DISCORD_RETRIES}. "
-                f"A aguardar {retry_after:.1f}s..."
+                f"⚠️ Discord rate limit."
+                f" Tentativa {attempt}/{MAX_DISCORD_RETRIES}."
             )
 
-            time.sleep(retry_after)
+            print(
+                f"⏳ A aguardar "
+                f"{retry_after:.1f} segundos..."
+            )
+
+            time.sleep(
+                retry_after
+            )
+
             continue
 
+        # Erros temporários do Discord
         if response.status_code >= 500:
-            wait = min(2 ** attempt, 30)
 
-            print(
-                f"⚠️ Discord HTTP {response.status_code}. "
-                f"A aguardar {wait}s..."
+            wait_time = min(
+                2 ** attempt,
+                30
             )
 
-            time.sleep(wait)
+            print(
+                f"⚠️ Discord HTTP "
+                f"{response.status_code}."
+            )
+
+            print(
+                f"⏳ A aguardar "
+                f"{wait_time} segundos..."
+            )
+
+            time.sleep(
+                wait_time
+            )
+
             continue
 
+        # Outros erros
         raise RuntimeError(
-            f"Discord webhook falhou: "
-            f"HTTP {response.status_code}: {response.text}"
+            f"Discord webhook erro: "
+            f"HTTP {response.status_code} "
+            f"{response.text}"
         )
 
     raise RuntimeError(
-        "Discord continuou a aplicar rate limit depois de várias tentativas."
+        "Discord continuou a aplicar rate limit "
+        "depois de várias tentativas."
     )
 
 
-def create_clip_payload(clip):
-    title = clip.get("title") or "Sem título"
-
-    creator_name = clip.get("creator_name") or "Desconhecido"
-
-    view_count = clip.get("view_count", 0)
-
-    clip_url = clip.get("url")
-
-    created_at = clip.get("created_at")
-
-    return {
-        "username": "JOTTA Clip Watcher",
-        "content": "🎬 **NOVO CLIP DO JOTTA**",
-        "embeds": [
-            {
-                "title": title,
-                "url": clip_url,
-                "description": (
-                    f"📺 **Streamer:** {CHANNEL_LOGIN}\n"
-                    f"✂️ **Criado por:** {creator_name}\n"
-                    f"👁️ **Visualizações:** {view_count}\n"
-                    f"🕐 **Criado:** {created_at}"
-                )
-            }
-        ]
-    }
-
+# ============================================================
+# MAIN
+# ============================================================
 
 def main():
-    if not CLIENT_ID:
-        raise RuntimeError("TWITCH_CLIENT_ID não está configurado.")
-
-    if not CLIENT_SECRET:
-        raise RuntimeError("TWITCH_CLIENT_SECRET não está configurado.")
-
-    if not DISCORD_CLIP_WEBHOOK_URL:
-        raise RuntimeError(
-            "DISCORD_CLIP_WEBHOOK_URL não está configurado."
-        )
-
-    state = load_state()
-
-    now = utc_now()
-
-    cutoff = now - timedelta(minutes=LOOKBACK_MINUTES)
 
     print("=" * 60)
     print("🎬 JOTTA TWITCH CLIP WATCHER")
     print("=" * 60)
 
-    print(f"📺 Canal: {CHANNEL_LOGIN}")
-    print(f"🕐 Hora UTC: {now.isoformat()}")
-    print(f"🔎 Janela: últimos {LOOKBACK_MINUTES} minutos")
+    if not CLIENT_ID:
+        raise RuntimeError(
+            "TWITCH_CLIENT_ID não configurado."
+        )
 
-    token = get_twitch_access_token()
+    if not CLIENT_SECRET:
+        raise RuntimeError(
+            "TWITCH_CLIENT_SECRET não configurado."
+        )
 
-    broadcaster_id = get_broadcaster_id(token)
+    if not DISCORD_WEBHOOK:
+        raise RuntimeError(
+            "DISCORD_CLIP_WEBHOOK_URL não configurado."
+        )
 
-    print(f"🆔 Broadcaster ID: {broadcaster_id}")
+    now = utc_now()
 
-    clips = get_recent_clips(
-        token,
-        broadcaster_id,
-        cutoff
+    print(
+        f"🕐 Hora actual UTC: "
+        f"{now.isoformat()}"
     )
 
-    print(f"🔎 Clips recebidos da Twitch: {len(clips)}")
+    print(
+        f"🔎 A procurar clips publicados "
+        f"nos últimos {LOOKBACK_MINUTES} minutos."
+    )
 
-    seen_clips = set(state.get("seen_clips", []))
+    # --------------------------------------------------------
+    # Estado
+    # --------------------------------------------------------
 
-    # Primeira execução:
-    # não enviamos os clips antigos existentes antes de instalar o sistema.
-    if not state.get("seen_clips"):
-        print("🆕 Primeira execução.")
+    state = load_state()
 
-        for clip in clips:
-            seen_clips.add(clip["id"])
-
-        state["seen_clips"] = list(seen_clips)
-
-        save_state(state)
-
-        print(
-            f"✅ {len(clips)} clips existentes marcados como vistos."
+    seen_clips = set(
+        state.get(
+            "seen_clips",
+            []
         )
-        print("📨 Nenhuma notificação enviada nesta primeira execução.")
+    )
 
-        return
+    # --------------------------------------------------------
+    # Twitch
+    # --------------------------------------------------------
 
-    new_clips = []
+    token = get_access_token()
+
+    broadcaster_id = get_broadcaster_id(
+        token
+    )
+
+    print(
+        f"🆔 Broadcaster ID: "
+        f"{broadcaster_id}"
+    )
+
+    clips, cutoff = get_clips(
+        token,
+        broadcaster_id
+    )
+
+    print(
+        f"🔎 Clips recebidos da Twitch: "
+        f"{len(clips)}"
+    )
+
+    print(
+        f"⏰ Limite temporal: "
+        f"{cutoff.isoformat()}"
+    )
+
+    # --------------------------------------------------------
+    # Filtrar clips
+    # --------------------------------------------------------
+
+    recent_clips = []
 
     for clip in clips:
 
         clip_id = clip["id"]
 
-        created_at = parse_datetime(
+        created_at = parse_twitch_time(
             clip["created_at"]
         )
 
+        age_seconds = (
+            now - created_at
+        ).total_seconds()
+
+        age_minutes = (
+            age_seconds / 60
+        )
+
+        print(
+            f"🎞️ {clip.get('title', 'Sem título')} "
+            f"| publicado há "
+            f"{age_minutes:.1f} min"
+        )
+
+        # Clip demasiado antigo
         if created_at < cutoff:
+
             continue
 
+        # Já enviado anteriormente
         if clip_id in seen_clips:
+
+            print(
+                "   ↳ ⏭️ Já enviado anteriormente."
+            )
+
             continue
 
-        new_clips.append(clip)
+        # Clip novo
+        recent_clips.append(
+            clip
+        )
 
     # Mais antigos primeiro
-    new_clips.sort(
-        key=lambda clip: parse_datetime(clip["created_at"])
+    recent_clips.sort(
+        key=lambda clip:
+        parse_twitch_time(
+            clip["created_at"]
+        )
     )
 
-    print(f"🆕 Clips novos encontrados: {len(new_clips)}")
+    print(
+        f"🆕 Clips novos nos últimos "
+        f"{LOOKBACK_MINUTES} minutos: "
+        f"{len(recent_clips)}"
+    )
 
-    notifications_sent = 0
+    # --------------------------------------------------------
+    # Enviar
+    # --------------------------------------------------------
 
-    for clip in new_clips:
+    sent = 0
+
+    for clip in recent_clips:
 
         clip_id = clip["id"]
 
         print(
-            f"🎬 Novo clip: {clip.get('title', 'Sem título')}"
+            f"📨 A enviar clip "
+            f"{clip_id} para Discord..."
         )
 
-        payload = create_clip_payload(clip)
-
         try:
-            send_discord(
-                DISCORD_CLIP_WEBHOOK_URL,
-                payload
+
+            send_to_discord(
+                clip
             )
 
-            # Só marcamos como visto DEPOIS de enviar com sucesso.
-            seen_clips.add(clip_id)
+            # Só guardamos depois do Discord
+            # confirmar que recebeu.
+            seen_clips.add(
+                clip_id
+            )
 
-            notifications_sent += 1
+            sent += 1
 
-            print("   ✅ Enviado para Discord.")
+            print(
+                "   ✅ Enviado com sucesso."
+            )
 
-            # Pequena pausa para evitar vários pedidos seguidos.
+            # Pequena pausa entre mensagens.
             time.sleep(1)
 
         except Exception as error:
 
             print(
-                f"   ❌ Não foi possível enviar o clip {clip_id}: {error}"
+                f"   ❌ Erro ao enviar: "
+                f"{error}"
             )
 
-            # Não adicionamos ao seen_clips.
-            # Assim será tentado novamente na próxima execução.
+            # IMPORTANTE:
+            # Não adicionamos o ID ao seen_clips.
+            #
+            # Assim, se falhar, tenta novamente
+            # na próxima execução.
 
-    state["seen_clips"] = list(seen_clips)
+    # --------------------------------------------------------
+    # Guardar estado
+    # --------------------------------------------------------
 
-    # Mantém apenas os últimos 5000 IDs para não deixar o ficheiro crescer
-    # indefinidamente.
-    if len(state["seen_clips"]) > 5000:
-
-        state["seen_clips"] = state["seen_clips"][-5000:]
-
-    save_state(state)
-
-    print("=" * 60)
-    print(
-        f"📊 Resultado: {notifications_sent} notificações enviadas."
+    state["seen_clips"] = list(
+        seen_clips
     )
+
+    # Limite para o ficheiro não crescer
+    # indefinidamente.
+    if len(
+        state["seen_clips"]
+    ) > 5000:
+
+        state["seen_clips"] = (
+            state["seen_clips"][-5000:]
+        )
+
+    save_state(
+        state
+    )
+
+    # --------------------------------------------------------
+    # Resultado
+    # --------------------------------------------------------
+
     print("=" * 60)
 
+    print(
+        f"📊 Clips analisados: "
+        f"{len(clips)}"
+    )
+
+    print(
+        f"🆕 Clips novos: "
+        f"{len(recent_clips)}"
+    )
+
+    print(
+        f"📨 Enviados para Discord: "
+        f"{sent}"
+    )
+
+    print(
+        f"🧠 Clips guardados na base: "
+        f"{len(state['seen_clips'])}"
+    )
+
+    print("=" * 60)
+
+
+# ============================================================
+# START
+# ============================================================
 
 if __name__ == "__main__":
+
     try:
+
         main()
 
     except Exception as error:
@@ -417,6 +650,8 @@ if __name__ == "__main__":
         print("❌ CHECK FALHOU")
         print("=" * 60)
 
-        print(str(error))
+        print(
+            f"Erro: {error}"
+        )
 
         sys.exit(1)
