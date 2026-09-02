@@ -1,10 +1,14 @@
-name: JOTTA Twitch Clip Watcher
+name: JOTTA Clip Watcher
 
 on:
   schedule:
-    - cron: "*/5 * * * *"
+    - cron: "*/10 * * * *"
 
   workflow_dispatch:
+
+concurrency:
+  group: jotta-clip-watcher
+  cancel-in-progress: false
 
 permissions:
   contents: write
@@ -24,14 +28,17 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests
+
       - name: Check JOTTA clips
         env:
           TWITCH_CLIENT_ID: ${{ secrets.TWITCH_CLIENT_ID }}
           TWITCH_CLIENT_SECRET: ${{ secrets.TWITCH_CLIENT_SECRET }}
           TWITCH_CHANNEL: jotta
-
           DISCORD_CLIP_WEBHOOK_URL: ${{ secrets.DISCORD_CLIP_WEBHOOK_URL }}
-          DISCORD_STATUS_WEBHOOK_URL: ${{ secrets.DISCORD_STATUS_WEBHOOK_URL }}
 
         run: |
           python src/main.py
@@ -39,7 +46,8 @@ jobs:
       - name: Save clip database
         if: always()
         run: |
-          if git diff --quiet -- data/seen_clips.json; then
+
+          if git diff --quiet -- data/state.json; then
             echo "No database changes."
             exit 0
           fi
@@ -47,6 +55,8 @@ jobs:
           git config user.name "JOTTA Clip Watcher"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          git add data/seen_clips.json
-          git commit -m "Update seen clips"
+          git add data/state.json
+
+          git commit -m "Update JOTTA clip database"
+
           git push
