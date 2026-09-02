@@ -28,7 +28,7 @@ SEARCH_WINDOW_HOURS = 24
 
 # Depois, dentro desses clips, só enviamos os que foram
 # criados nos últimos 10 minutos.
-RECENT_WINDOW_MINUTES = 10
+RECENT_WINDOW_MINUTES = 15
 
 # Número máximo de páginas.
 MAX_PAGES = 10
