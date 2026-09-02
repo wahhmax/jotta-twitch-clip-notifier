@@ -7,20 +7,36 @@ from datetime import datetime, timedelta, timezone
 import requests
 
 
+# ============================================================
+# CONFIGURAÇÃO
+# ============================================================
+
 TWITCH_API = "https://api.twitch.tv/helix"
-TWITCH_TOKEN_URL = "https://id.twitch.tv/oauth2/token"
+TWITCH_AUTH_URL = "https://id.twitch.tv/oauth2/token"
 
 CHANNEL = "jotta"
 
 CLIENT_ID = os.getenv("TWITCH_CLIENT_ID")
 CLIENT_SECRET = os.getenv("TWITCH_CLIENT_SECRET")
+
 DISCORD_WEBHOOK = os.getenv("DISCORD_CLIP_WEBHOOK_URL")
 
 STATE_FILE = "data/state.json"
 
-# Procurar clips dos últimos 10 minutos
-LOOKBACK_MINUTES = 10
+# Procuramos clips dentro das últimas 24 horas.
+SEARCH_WINDOW_HOURS = 24
 
+# Depois, dentro desses clips, só enviamos os que foram
+# criados nos últimos 10 minutos.
+RECENT_WINDOW_MINUTES = 10
+
+# Número máximo de páginas.
+MAX_PAGES = 10
+
+
+# ============================================================
+# TEMPO
+# ============================================================
 
 def now_utc():
     return datetime.now(timezone.utc)
@@ -32,40 +48,81 @@ def parse_time(value):
     )
 
 
+def format_time(dt):
+    return dt.strftime(
+        "%d/%m/%Y %H:%M:%S UTC"
+    )
+
+
+# ============================================================
+# ESTADO
+# ============================================================
+
 def load_state():
 
     if not os.path.exists(STATE_FILE):
-        return {"seen_clips": []}
 
-    with open(
-        STATE_FILE,
-        "r",
-        encoding="utf-8"
-    ) as f:
-        return json.load(f)
+        return {
+            "seen_clips": []
+        }
+
+    try:
+
+        with open(
+            STATE_FILE,
+            "r",
+            encoding="utf-8"
+        ) as file:
+
+            state = json.load(file)
+
+        state.setdefault(
+            "seen_clips",
+            []
+        )
+
+        return state
+
+    except Exception as error:
+
+        print(
+            f"⚠️ Erro ao ler state.json: {error}"
+        )
+
+        return {
+            "seen_clips": []
+        }
 
 
 def save_state(state):
 
-    os.makedirs("data", exist_ok=True)
+    os.makedirs(
+        "data",
+        exist_ok=True
+    )
 
     with open(
         STATE_FILE,
         "w",
         encoding="utf-8"
-    ) as f:
+    ) as file:
+
         json.dump(
             state,
-            f,
+            file,
             indent=2,
             ensure_ascii=False
         )
 
 
-def get_token():
+# ============================================================
+# TWITCH AUTH
+# ============================================================
 
-    r = requests.post(
-        TWITCH_TOKEN_URL,
+def get_access_token():
+
+    response = requests.post(
+        TWITCH_AUTH_URL,
         params={
             "client_id": CLIENT_ID,
             "client_secret": CLIENT_SECRET,
@@ -75,17 +132,30 @@ def get_token():
     )
 
     print(
-        f"🔐 Twitch OAuth: HTTP {r.status_code}"
+        f"🔐 Twitch OAuth: HTTP {response.status_code}"
     )
 
-    r.raise_for_status()
+    if response.status_code != 200:
 
-    return r.json()["access_token"]
+        raise RuntimeError(
+            f"Twitch OAuth falhou: "
+            f"{response.text}"
+        )
+
+    return response.json()["access_token"]
 
 
-def twitch_get(endpoint, token, params):
+# ============================================================
+# TWITCH API
+# ============================================================
 
-    r = requests.get(
+def twitch_get(
+    endpoint,
+    token,
+    params
+):
+
+    response = requests.get(
         f"{TWITCH_API}/{endpoint}",
         headers={
             "Client-ID": CLIENT_ID,
@@ -96,12 +166,19 @@ def twitch_get(endpoint, token, params):
     )
 
     print(
-        f"🌐 Twitch {endpoint}: HTTP {r.status_code}"
+        f"🌐 Twitch {endpoint}: "
+        f"HTTP {response.status_code}"
     )
 
-    r.raise_for_status()
+    if response.status_code != 200:
 
-    return r.json()
+        raise RuntimeError(
+            f"Twitch API falhou: "
+            f"HTTP {response.status_code}: "
+            f"{response.text}"
+        )
+
+    return response.json()
 
 
 def get_channel_id(token):
@@ -114,134 +191,367 @@ def get_channel_id(token):
         }
     )
 
-    users = data.get("data", [])
+    users = data.get(
+        "data",
+        []
+    )
 
     if not users:
+
         raise RuntimeError(
-            f"Canal {CHANNEL} não encontrado."
+            f"O canal '{CHANNEL}' não foi encontrado."
         )
 
     return users[0]["id"]
 
 
-def get_clips(token, channel_id):
+# ============================================================
+# OBTER CLIPS DAS ÚLTIMAS 24 HORAS
+# ============================================================
 
-    data = twitch_get(
-        "clips",
-        token,
-        {
-            "broadcaster_id": channel_id,
-            "first": 100
-        }
+def get_last_24h_clips(
+    token,
+    channel_id
+):
+
+    now = now_utc()
+
+    start_time = (
+        now
+        - timedelta(
+            hours=SEARCH_WINDOW_HOURS
+        )
     )
 
-    return data.get("data", [])
+    print(
+        f"📅 Procurar clips desde: "
+        f"{format_time(start_time)}"
+    )
+
+    print(
+        f"📅 Até: "
+        f"{format_time(now)}"
+    )
+
+    all_clips = []
+
+    cursor = None
+
+    for page in range(
+        1,
+        MAX_PAGES + 1
+    ):
+
+        params = {
+
+            "broadcaster_id": channel_id,
+
+            # IMPORTANTE:
+            # A Twitch vai procurar directamente
+            # dentro das últimas 24 horas.
+            "started_at": start_time.isoformat(),
+
+            "ended_at": now.isoformat(),
+
+            "first": 100
+        }
+
+        if cursor:
+
+            params["after"] = cursor
+
+        data = twitch_get(
+            "clips",
+            token,
+            params
+        )
+
+        clips = data.get(
+            "data",
+            []
+        )
+
+        print(
+            f"📦 Página {page}: "
+            f"{len(clips)} clips"
+        )
+
+        all_clips.extend(
+            clips
+        )
+
+        pagination = data.get(
+            "pagination",
+            {}
+        )
+
+        cursor = pagination.get(
+            "cursor"
+        )
+
+        if not cursor:
+
+            break
+
+    return all_clips
 
 
-def send_discord(clip):
+# ============================================================
+# DISCORD
+# ============================================================
+
+def send_to_discord(
+    clip
+):
+
+    if not DISCORD_WEBHOOK:
+
+        raise RuntimeError(
+            "DISCORD_CLIP_WEBHOOK_URL "
+            "não está configurado."
+        )
+
+    title = clip.get(
+        "title",
+        "Novo clip"
+    )
+
+    creator = clip.get(
+        "creator_name",
+        "Desconhecido"
+    )
+
+    views = clip.get(
+        "view_count",
+        0
+    )
+
+    url = clip.get(
+        "url"
+    )
+
+    created_at = clip.get(
+        "created_at"
+    )
 
     payload = {
-        "username": "JOTTA Clip Watcher",
-        "content": "🎬 **NOVO CLIP DO JOTTA**",
+
+        "username":
+            "JOTTA Clip Watcher",
+
+        "content":
+            "🎬 **NOVO CLIP DO JOTTA**",
+
         "embeds": [
+
             {
-                "title": clip.get(
-                    "title",
-                    "Novo clip"
-                ),
-                "url": clip["url"],
-                "description": (
-                    f"📺 **Streamer:** {CHANNEL}\n"
-                    f"✂️ **Criado por:** "
-                    f"{clip.get('creator_name', 'Desconhecido')}\n"
-                    f"👁️ **Visualizações:** "
-                    f"{clip.get('view_count', 0)}\n"
-                    f"🕐 **Publicado:** "
-                    f"{clip['created_at']}"
-                )
+
+                "title":
+                    title,
+
+                "url":
+                    url,
+
+                "description":
+                    (
+                        f"📺 **Streamer:** "
+                        f"{CHANNEL}\n\n"
+
+                        f"✂️ **Criado por:** "
+                        f"{creator}\n\n"
+
+                        f"👁️ **Visualizações:** "
+                        f"{views}\n\n"
+
+                        f"🕐 **Publicado:** "
+                        f"{created_at}"
+                    ),
+
+                "footer": {
+
+                    "text":
+                        "JOTTA Clip Watcher"
+                }
             }
         ]
     }
 
-    print("📨 A enviar para Discord...")
+    print(
+        "📨 A enviar clip para Discord..."
+    )
 
-    for attempt in range(5):
+    for attempt in range(
+        1,
+        6
+    ):
 
-        r = requests.post(
+        response = requests.post(
             DISCORD_WEBHOOK,
             json=payload,
             timeout=30
         )
 
         print(
-            f"📡 Discord: HTTP {r.status_code}"
+            f"📡 Discord: "
+            f"HTTP {response.status_code}"
         )
 
-        if r.status_code in (200, 204):
-            print("✅ Discord recebeu o clip.")
-            return True
-
-        if r.status_code == 429:
-
-            try:
-                retry = float(
-                    r.json().get(
-                        "retry_after",
-                        2
-                    )
-                )
-            except Exception:
-                retry = 2
+        if response.status_code in (
+            200,
+            204
+        ):
 
             print(
-                f"⏳ Discord rate limit. "
-                f"A aguardar {retry} segundos."
+                "✅ Discord recebeu o clip."
+            )
+
+            return True
+
+        # Rate limit
+        if response.status_code == 429:
+
+            retry_after = None
+
+            try:
+
+                body = response.json()
+
+                retry_after = body.get(
+                    "retry_after"
+                )
+
+            except Exception:
+                pass
+
+            if retry_after is None:
+
+                retry_after = 2 ** attempt
+
+            retry_after = (
+                float(retry_after)
+                + 0.5
+            )
+
+            print(
+                f"⚠️ Discord rate limit."
+            )
+
+            print(
+                f"⏳ A aguardar "
+                f"{retry_after:.1f}s..."
             )
 
             time.sleep(
-                retry + 0.5
+                retry_after
+            )
+
+            continue
+
+        # Erro temporário
+        if response.status_code >= 500:
+
+            wait = min(
+                2 ** attempt,
+                30
+            )
+
+            print(
+                f"⚠️ Discord HTTP "
+                f"{response.status_code}"
+            )
+
+            print(
+                f"⏳ A aguardar {wait}s..."
+            )
+
+            time.sleep(
+                wait
             )
 
             continue
 
         print(
-            f"❌ Discord respondeu: {r.text}"
+            f"❌ Discord respondeu: "
+            f"{response.text}"
         )
 
         return False
 
+    print(
+        "❌ Discord continuou a rejeitar "
+        "o pedido depois de várias tentativas."
+    )
+
     return False
 
+
+# ============================================================
+# MAIN
+# ============================================================
 
 def main():
 
     print("=" * 70)
-    print("🎬 JOTTA CLIP WATCHER")
+
+    print(
+        "🎬 JOTTA TWITCH CLIP WATCHER"
+    )
+
     print("=" * 70)
 
-    current_time = now_utc()
+    # --------------------------------------------------------
+    # Validar secrets
+    # --------------------------------------------------------
 
-    cutoff = (
-        current_time
+    if not CLIENT_ID:
+
+        raise RuntimeError(
+            "TWITCH_CLIENT_ID não configurado."
+        )
+
+    if not CLIENT_SECRET:
+
+        raise RuntimeError(
+            "TWITCH_CLIENT_SECRET não configurado."
+        )
+
+    if not DISCORD_WEBHOOK:
+
+        raise RuntimeError(
+            "DISCORD_CLIP_WEBHOOK_URL não configurado."
+        )
+
+    # --------------------------------------------------------
+    # Tempo
+    # --------------------------------------------------------
+
+    now = now_utc()
+
+    recent_cutoff = (
+        now
         - timedelta(
-            minutes=LOOKBACK_MINUTES
+            minutes=RECENT_WINDOW_MINUTES
         )
     )
 
     print(
         f"🕐 AGORA UTC: "
-        f"{current_time.isoformat()}"
+        f"{format_time(now)}"
     )
 
     print(
-        f"⏰ LIMITE UTC: "
-        f"{cutoff.isoformat()}"
+        f"🔎 Pesquisa Twitch: "
+        f"últimas {SEARCH_WINDOW_HOURS} horas"
     )
 
     print(
-        f"🔎 Janela: últimos "
-        f"{LOOKBACK_MINUTES} minutos"
+        f"🎯 Novo clip: últimos "
+        f"{RECENT_WINDOW_MINUTES} minutos"
     )
+
+    # --------------------------------------------------------
+    # Estado
+    # --------------------------------------------------------
 
     state = load_state()
 
@@ -257,44 +567,53 @@ def main():
         f"{len(seen)}"
     )
 
-    token = get_token()
+    # --------------------------------------------------------
+    # Twitch
+    # --------------------------------------------------------
+
+    token = get_access_token()
 
     channel_id = get_channel_id(
         token
     )
 
     print(
-        f"🆔 JOTTA ID: {channel_id}"
+        f"🆔 JOTTA ID: "
+        f"{channel_id}"
     )
 
-    clips = get_clips(
+    clips = get_last_24h_clips(
         token,
         channel_id
     )
 
     print(
-        f"📦 Twitch devolveu "
-        f"{len(clips)} clips"
+        f"📦 Total de clips encontrados "
+        f"nas últimas 24h: {len(clips)}"
     )
 
-    print("-" * 70)
+    # --------------------------------------------------------
+    # Filtrar
+    # --------------------------------------------------------
 
-    new_count = 0
+    new_clips = []
+
+    print("-" * 70)
 
     for clip in clips:
 
         clip_id = clip["id"]
 
-        created = parse_time(
+        created_at = parse_time(
             clip["created_at"]
         )
 
-        age = (
-            current_time - created
+        age_minutes = (
+            now - created_at
         ).total_seconds() / 60
 
         print(
-            f"🎞️ {clip['title']}"
+            f"🎞️ {clip.get('title', 'Sem título')}"
         )
 
         print(
@@ -302,13 +621,16 @@ def main():
         )
 
         print(
-            f"   Criado: {clip['created_at']}"
+            f"   Criado: "
+            f"{format_time(created_at)}"
         )
 
         print(
-            f"   Idade: {age:.2f} minutos"
+            f"   Idade: "
+            f"{age_minutes:.2f} minutos"
         )
 
+        # Já enviado
         if clip_id in seen:
 
             print(
@@ -319,21 +641,69 @@ def main():
 
             continue
 
-        if created < cutoff:
+        # Futuro, por alguma diferença de relógio
+        if created_at > now:
 
             print(
-                "   ⏭️ MAIS ANTIGO QUE 10 MINUTOS"
+                "   ⚠️ Data futura. Ignorado."
             )
 
             print("-" * 70)
 
             continue
 
+        # Mais antigo que os últimos 10 minutos
+        if created_at < recent_cutoff:
+
+            print(
+                "   ⏭️ MAIS ANTIGO QUE "
+                f"{RECENT_WINDOW_MINUTES} MINUTOS"
+            )
+
+            print("-" * 70)
+
+            continue
+
+        # Novo
         print(
             "   🟢 NOVO CLIP DETETADO!"
         )
 
-        success = send_discord(
+        new_clips.append(
+            clip
+        )
+
+        print("-" * 70)
+
+    # Mais antigos primeiro
+    new_clips.sort(
+        key=lambda clip:
+        parse_time(
+            clip["created_at"]
+        )
+    )
+
+    print(
+        f"🆕 Clips novos nos últimos "
+        f"{RECENT_WINDOW_MINUTES} minutos: "
+        f"{len(new_clips)}"
+    )
+
+    # --------------------------------------------------------
+    # Enviar
+    # --------------------------------------------------------
+
+    sent = 0
+
+    for clip in new_clips:
+
+        clip_id = clip["id"]
+
+        print(
+            f"📨 Clip: {clip_id}"
+        )
+
+        success = send_to_discord(
             clip
         )
 
@@ -343,51 +713,99 @@ def main():
                 clip_id
             )
 
-            new_count += 1
+            sent += 1
 
             print(
-                "   💾 ID guardado."
+                "💾 ID guardado."
             )
 
         else:
 
             print(
-                "   ❌ Não foi guardado porque "
-                "o Discord falhou."
+                "❌ ID NÃO guardado."
             )
 
-        print("-" * 70)
+            print(
+                "🔁 Será tentado novamente "
+                "na próxima execução."
+            )
+
+        # Evitar pedidos seguidos
+        time.sleep(1)
+
+    # --------------------------------------------------------
+    # Guardar estado
+    # --------------------------------------------------------
 
     state["seen_clips"] = list(
         seen
     )
 
+    # Limitar tamanho
+    if len(
+        state["seen_clips"]
+    ) > 5000:
+
+        state["seen_clips"] = (
+            state["seen_clips"][-5000:]
+        )
+
     save_state(
         state
     )
 
-    print("=" * 70)
-
-    print(
-        f"🆕 NOVOS CLIPS: {new_count}"
-    )
-
-    print(
-        f"🧠 TOTAL GUARDADO: {len(seen)}"
-    )
+    # --------------------------------------------------------
+    # Resultado
+    # --------------------------------------------------------
 
     print("=" * 70)
 
+    print(
+        f"📊 Clips encontrados nas últimas 24h: "
+        f"{len(clips)}"
+    )
+
+    print(
+        f"🎯 Clips dentro dos últimos "
+        f"{RECENT_WINDOW_MINUTES} min: "
+        f"{len(new_clips)}"
+    )
+
+    print(
+        f"📨 Enviados para Discord: "
+        f"{sent}"
+    )
+
+    print(
+        f"🧠 Total de IDs guardados: "
+        f"{len(seen)}"
+    )
+
+    print("=" * 70)
+
+
+# ============================================================
+# START
+# ============================================================
 
 if __name__ == "__main__":
 
     try:
+
         main()
 
     except Exception as error:
 
+        print("=" * 70)
+
         print(
-            f"❌ ERRO: {error}"
+            "❌ CHECK FALHOU"
+        )
+
+        print("=" * 70)
+
+        print(
+            f"Erro: {error}"
         )
 
         sys.exit(1)
