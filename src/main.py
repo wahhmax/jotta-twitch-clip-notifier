@@ -1,441 +1,410 @@
 import json
 import os
 import sys
-from datetime import datetime, timezone
-from pathlib import Path
-from urllib.parse import urlencode
-from urllib.request import Request, urlopen
-from urllib.error import HTTPError, URLError
+import time
+from datetime import datetime, timedelta, timezone
+
+import requests
 
 
-TWITCH_CLIENT_ID = os.environ["TWITCH_CLIENT_ID"]
-TWITCH_CLIENT_SECRET = os.environ["TWITCH_CLIENT_SECRET"]
-TWITCH_CHANNEL = os.environ.get("TWITCH_CHANNEL", "jotta")
+TWITCH_API_BASE = "https://api.twitch.tv/helix"
+TWITCH_AUTH_URL = "https://id.twitch.tv/oauth2/token"
 
-DISCORD_CLIP_WEBHOOK_URL = os.environ["DISCORD_CLIP_WEBHOOK_URL"]
-DISCORD_STATUS_WEBHOOK_URL = os.environ["DISCORD_STATUS_WEBHOOK_URL"]
+CHANNEL_LOGIN = os.getenv("TWITCH_CHANNEL", "jotta")
 
-DATA_FILE = Path("data/seen_clips.json")
+CLIENT_ID = os.getenv("TWITCH_CLIENT_ID")
+CLIENT_SECRET = os.getenv("TWITCH_CLIENT_SECRET")
 
-CLIPS_TO_CHECK = 100
+DISCORD_CLIP_WEBHOOK_URL = os.getenv("DISCORD_CLIP_WEBHOOK_URL")
+
+STATE_FILE = "data/state.json"
+
+LOOKBACK_MINUTES = 15
+DISCORD_RETRIES = 5
 
 
-def twitch_request(url, headers=None, method="GET", data=None):
-    request = Request(
-        url,
-        headers=headers or {},
-        method=method
-    )
+def utc_now():
+    return datetime.now(timezone.utc)
 
-    if data is not None:
-        request.data = data
+
+def parse_datetime(value):
+    return datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+
+def load_state():
+    if not os.path.exists(STATE_FILE):
+        return {
+            "seen_clips": [],
+            "last_status_at": None
+        }
 
     try:
-        with urlopen(request, timeout=30) as response:
-            body = response.read().decode("utf-8")
-            return json.loads(body)
+        with open(STATE_FILE, "r", encoding="utf-8") as file:
+            state = json.load(file)
 
-    except HTTPError as error:
-        body = error.read().decode("utf-8", errors="replace")
-        raise RuntimeError(
-            f"Twitch API HTTP {error.code}: {body}"
-        )
+        state.setdefault("seen_clips", [])
+        state.setdefault("last_status_at", None)
 
-    except URLError as error:
-        raise RuntimeError(
-            f"Erro de ligação à Twitch API: {error}"
-        )
+        return state
+
+    except Exception:
+        print("⚠️ Não foi possível ler o state.json. A iniciar estado novo.")
+
+        return {
+            "seen_clips": [],
+            "last_status_at": None
+        }
 
 
-def get_app_access_token():
-    params = urlencode({
-        "client_id": TWITCH_CLIENT_ID,
-        "client_secret": TWITCH_CLIENT_SECRET,
-        "grant_type": "client_credentials"
-    })
+def save_state(state):
+    os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
 
-    url = f"https://id.twitch.tv/oauth2/token?{params}"
+    with open(STATE_FILE, "w", encoding="utf-8") as file:
+        json.dump(state, file, indent=2, ensure_ascii=False)
 
-    response = twitch_request(
-        url,
-        method="POST"
+
+def get_twitch_access_token():
+    response = requests.post(
+        TWITCH_AUTH_URL,
+        params={
+            "client_id": CLIENT_ID,
+            "client_secret": CLIENT_SECRET,
+            "grant_type": "client_credentials"
+        },
+        timeout=30
     )
 
-    if "access_token" not in response:
+    if response.status_code != 200:
         raise RuntimeError(
-            f"Não foi possível obter o token Twitch: {response}"
+            f"Twitch OAuth falhou: HTTP {response.status_code}: {response.text}"
         )
 
-    return response["access_token"]
+    return response.json()["access_token"]
 
 
-def get_broadcaster(token):
-    params = urlencode({
-        "login": TWITCH_CHANNEL
-    })
+def twitch_request(endpoint, token, params=None):
+    headers = {
+        "Client-ID": CLIENT_ID,
+        "Authorization": f"Bearer {token}"
+    }
 
-    url = f"https://api.twitch.tv/helix/users?{params}"
+    response = requests.get(
+        f"{TWITCH_API_BASE}/{endpoint}",
+        headers=headers,
+        params=params,
+        timeout=30
+    )
 
-    response = twitch_request(
-        url,
-        headers={
-            "Client-ID": TWITCH_CLIENT_ID,
-            "Authorization": f"Bearer {token}"
+    if response.status_code != 200:
+        raise RuntimeError(
+            f"Twitch API falhou: HTTP {response.status_code}: {response.text}"
+        )
+
+    return response.json()
+
+
+def get_broadcaster_id(token):
+    data = twitch_request(
+        "users",
+        token,
+        params={
+            "login": CHANNEL_LOGIN
         }
     )
 
-    users = response.get("data", [])
+    users = data.get("data", [])
 
     if not users:
         raise RuntimeError(
-            f"O canal Twitch '{TWITCH_CHANNEL}' não foi encontrado."
+            f"O canal Twitch '{CHANNEL_LOGIN}' não foi encontrado."
         )
 
-    return users[0]
+    return users[0]["id"]
 
 
-def get_clips(token, broadcaster_id):
-    params = urlencode({
-        "broadcaster_id": broadcaster_id,
-        "first": CLIPS_TO_CHECK
-    })
+def get_recent_clips(token, broadcaster_id, cutoff):
+    clips = []
 
-    url = f"https://api.twitch.tv/helix/clips?{params}"
+    cursor = None
 
-    response = twitch_request(
-        url,
-        headers={
-            "Client-ID": TWITCH_CLIENT_ID,
-            "Authorization": f"Bearer {token}"
+    # Até 5 páginas de 100 clips.
+    # Normalmente a primeira página será mais do que suficiente.
+    for _ in range(5):
+
+        params = {
+            "broadcaster_id": broadcaster_id,
+            "first": 100
         }
-    )
 
-    return response.get("data", [])
+        if cursor:
+            params["after"] = cursor
 
-
-def load_seen_clips():
-    DATA_FILE.parent.mkdir(parents=True, exist_ok=True)
-
-    if not DATA_FILE.exists():
-        return set()
-
-    try:
-        with DATA_FILE.open("r", encoding="utf-8") as file:
-            data = json.load(file)
-
-        if not isinstance(data, list):
-            return set()
-
-        return set(data)
-
-    except Exception:
-        return set()
-
-
-def save_seen_clips(seen):
-    DATA_FILE.parent.mkdir(parents=True, exist_ok=True)
-
-    # Guardamos apenas os últimos 1000 IDs.
-    # É mais do que suficiente para evitar duplicados.
-    latest = list(seen)[-1000:]
-
-    with DATA_FILE.open("w", encoding="utf-8") as file:
-        json.dump(
-            latest,
-            file,
-            ensure_ascii=False,
-            indent=2
+        data = twitch_request(
+            "clips",
+            token,
+            params=params
         )
+
+        page = data.get("data", [])
+
+        if not page:
+            break
+
+        clips.extend(page)
+
+        # Os clips vêm dos mais recentes para os mais antigos.
+        oldest = min(
+            parse_datetime(clip["created_at"])
+            for clip in page
+        )
+
+        if oldest < cutoff:
+            break
+
+        cursor = data.get("pagination", {}).get("cursor")
+
+        if not cursor:
+            break
+
+    return clips
 
 
 def send_discord(webhook_url, payload):
-    body = json.dumps(payload).encode("utf-8")
+    if not webhook_url:
+        raise RuntimeError("DISCORD_CLIP_WEBHOOK_URL não está configurado.")
 
-    request = Request(
-        webhook_url,
-        data=body,
-        headers={
-            "Content-Type": "application/json",
-            "User-Agent": "JottaTwitchClipNotifier/1.0"
-        },
-        method="POST"
-    )
+    for attempt in range(1, DISCORD_RETRIES + 1):
 
-    try:
-        with urlopen(request, timeout=30) as response:
-            return response.status
+        response = requests.post(
+            webhook_url,
+            json=payload,
+            timeout=30
+        )
 
-    except HTTPError as error:
-        body = error.read().decode("utf-8", errors="replace")
+        if response.status_code in (200, 204):
+            return True
+
+        if response.status_code == 429:
+
+            retry_after = None
+
+            try:
+                body = response.json()
+                retry_after = body.get("retry_after")
+            except Exception:
+                pass
+
+            if retry_after is None:
+                header = response.headers.get("Retry-After")
+
+                if header:
+                    try:
+                        retry_after = float(header)
+                    except ValueError:
+                        retry_after = None
+
+            if retry_after is None:
+                retry_after = min(2 ** attempt, 30)
+
+            retry_after = float(retry_after) + 0.5
+
+            print(
+                f"⚠️ Discord rate limit (429). "
+                f"Tentativa {attempt}/{DISCORD_RETRIES}. "
+                f"A aguardar {retry_after:.1f}s..."
+            )
+
+            time.sleep(retry_after)
+            continue
+
+        if response.status_code >= 500:
+            wait = min(2 ** attempt, 30)
+
+            print(
+                f"⚠️ Discord HTTP {response.status_code}. "
+                f"A aguardar {wait}s..."
+            )
+
+            time.sleep(wait)
+            continue
 
         raise RuntimeError(
-            f"Discord webhook HTTP {error.code}: {body}"
+            f"Discord webhook falhou: "
+            f"HTTP {response.status_code}: {response.text}"
         )
 
-
-def format_datetime(value):
-    try:
-        dt = datetime.fromisoformat(
-            value.replace("Z", "+00:00")
-        )
-
-        return dt.astimezone().strftime(
-            "%d/%m/%Y %H:%M:%S"
-        )
-
-    except Exception:
-        return value
-
-
-def send_clip_notification(clip):
-    title = clip.get("title") or "Sem título"
-    creator = clip.get("creator_name") or "Desconhecido"
-    views = clip.get("view_count", 0)
-    created_at = format_datetime(
-        clip.get("created_at", "")
+    raise RuntimeError(
+        "Discord continuou a aplicar rate limit depois de várias tentativas."
     )
-    url = clip.get("url", "")
 
-    payload = {
+
+def create_clip_payload(clip):
+    title = clip.get("title") or "Sem título"
+
+    creator_name = clip.get("creator_name") or "Desconhecido"
+
+    view_count = clip.get("view_count", 0)
+
+    clip_url = clip.get("url")
+
+    created_at = clip.get("created_at")
+
+    return {
         "username": "JOTTA Clip Watcher",
+        "content": "🎬 **NOVO CLIP DO JOTTA**",
         "embeds": [
             {
-                "title": "🎬 NOVO CLIP DETETADO",
-                "url": url,
+                "title": title,
+                "url": clip_url,
                 "description": (
-                    f"Foi encontrado um novo clip no canal **{TWITCH_CHANNEL}**."
-                ),
-                "fields": [
-                    {
-                        "name": "📺 Streamer",
-                        "value": f"**{TWITCH_CHANNEL}**",
-                        "inline": True
-                    },
-                    {
-                        "name": "✂️ Criado por",
-                        "value": creator,
-                        "inline": True
-                    },
-                    {
-                        "name": "👁️ Visualizações",
-                        "value": str(views),
-                        "inline": True
-                    },
-                    {
-                        "name": "🎞️ Título",
-                        "value": title[:1024],
-                        "inline": False
-                    },
-                    {
-                        "name": "🔗 Clip",
-                        "value": f"[**ABRIR CLIP NA TWITCH**]({url})",
-                        "inline": False
-                    }
-                ],
-                "footer": {
-                    "text": f"Criado em {created_at}"
-                },
-                "timestamp": clip.get("created_at")
+                    f"📺 **Streamer:** {CHANNEL_LOGIN}\n"
+                    f"✂️ **Criado por:** {creator_name}\n"
+                    f"👁️ **Visualizações:** {view_count}\n"
+                    f"🕐 **Criado:** {created_at}"
+                )
             }
         ]
     }
 
-    send_discord(
-        DISCORD_CLIP_WEBHOOK_URL,
-        payload
-    )
-
-
-def send_status(
-    clips_checked,
-    new_clips,
-    notifications_sent,
-    error=None
-):
-    now = datetime.now(
-        timezone.utc
-    ).astimezone().strftime(
-        "%d/%m/%Y %H:%M:%S"
-    )
-
-    if error:
-        payload = {
-            "username": "JOTTA Clip Watcher",
-            "embeds": [
-                {
-                    "title": "🔴 CHECK FALHOU",
-                    "description": (
-                        f"O sistema tentou verificar o canal "
-                        f"**{TWITCH_CHANNEL}**, mas ocorreu um erro."
-                    ),
-                    "fields": [
-                        {
-                            "name": "❌ Erro",
-                            "value": str(error)[:1024],
-                            "inline": False
-                        },
-                        {
-                            "name": "🕐 Hora",
-                            "value": now,
-                            "inline": True
-                        }
-                    ]
-                }
-            ]
-        }
-
-    else:
-        payload = {
-            "username": "JOTTA Clip Watcher",
-            "embeds": [
-                {
-                    "title": "✅ CHECK EXECUTADO",
-                    "description": (
-                        f"Verificação concluída para **{TWITCH_CHANNEL}**."
-                    ),
-                    "fields": [
-                        {
-                            "name": "📺 Canal",
-                            "value": TWITCH_CHANNEL,
-                            "inline": True
-                        },
-                        {
-                            "name": "🔎 Clips analisados",
-                            "value": str(clips_checked),
-                            "inline": True
-                        },
-                        {
-                            "name": "🆕 Clips novos",
-                            "value": str(new_clips),
-                            "inline": True
-                        },
-                        {
-                            "name": "📨 Notificações enviadas",
-                            "value": str(notifications_sent),
-                            "inline": True
-                        },
-                        {
-                            "name": "🕐 Hora",
-                            "value": now,
-                            "inline": True
-                        }
-                    ],
-                    "footer": {
-                        "text": "JOTTA Twitch Clip Watcher"
-                    }
-                }
-            ]
-        }
-
-    send_discord(
-        DISCORD_STATUS_WEBHOOK_URL,
-        payload
-    )
-
 
 def main():
-    print("=" * 60)
-    print("JOTTA TWITCH CLIP WATCHER")
-    print("=" * 60)
+    if not CLIENT_ID:
+        raise RuntimeError("TWITCH_CLIENT_ID não está configurado.")
 
-    seen = load_seen_clips()
+    if not CLIENT_SECRET:
+        raise RuntimeError("TWITCH_CLIENT_SECRET não está configurado.")
 
-    print("A obter token da Twitch...")
-    token = get_app_access_token()
-
-    print(f"A procurar canal: {TWITCH_CHANNEL}")
-    broadcaster = get_broadcaster(token)
-
-    broadcaster_id = broadcaster["id"]
-
-    print(
-        f"Canal encontrado: "
-        f"{broadcaster.get('display_name', TWITCH_CHANNEL)} "
-        f"({broadcaster_id})"
-    )
-
-    print("A procurar clips...")
-    clips = get_clips(
-        token,
-        broadcaster_id
-    )
-
-    print(f"Clips recebidos: {len(clips)}")
-
-    # IMPORTANTE:
-    # Na primeira execução não queremos enviar todos
-    # os clips históricos para o Discord.
-    first_run = not DATA_FILE.exists()
-
-    if first_run:
-        print(
-            "Primeira execução detectada. "
-            "A marcar clips existentes como vistos."
+    if not DISCORD_CLIP_WEBHOOK_URL:
+        raise RuntimeError(
+            "DISCORD_CLIP_WEBHOOK_URL não está configurado."
         )
+
+    state = load_state()
+
+    now = utc_now()
+
+    cutoff = now - timedelta(minutes=LOOKBACK_MINUTES)
+
+    print("=" * 60)
+    print("🎬 JOTTA TWITCH CLIP WATCHER")
+    print("=" * 60)
+
+    print(f"📺 Canal: {CHANNEL_LOGIN}")
+    print(f"🕐 Hora UTC: {now.isoformat()}")
+    print(f"🔎 Janela: últimos {LOOKBACK_MINUTES} minutos")
+
+    token = get_twitch_access_token()
+
+    broadcaster_id = get_broadcaster_id(token)
+
+    print(f"🆔 Broadcaster ID: {broadcaster_id}")
+
+    clips = get_recent_clips(
+        token,
+        broadcaster_id,
+        cutoff
+    )
+
+    print(f"🔎 Clips recebidos da Twitch: {len(clips)}")
+
+    seen_clips = set(state.get("seen_clips", []))
+
+    # Primeira execução:
+    # não enviamos os clips antigos existentes antes de instalar o sistema.
+    if not state.get("seen_clips"):
+        print("🆕 Primeira execução.")
 
         for clip in clips:
-            clip_id = clip.get("id")
+            seen_clips.add(clip["id"])
 
-            if clip_id:
-                seen.add(clip_id)
+        state["seen_clips"] = list(seen_clips)
 
-        save_seen_clips(seen)
+        save_state(state)
 
-        send_status(
-            clips_checked=len(clips),
-            new_clips=0,
-            notifications_sent=0
+        print(
+            f"✅ {len(clips)} clips existentes marcados como vistos."
         )
+        print("📨 Nenhuma notificação enviada nesta primeira execução.")
 
-        print("Primeira execução concluída.")
         return
 
     new_clips = []
 
     for clip in clips:
-        clip_id = clip.get("id")
 
-        if not clip_id:
+        clip_id = clip["id"]
+
+        created_at = parse_datetime(
+            clip["created_at"]
+        )
+
+        if created_at < cutoff:
             continue
 
-        if clip_id not in seen:
-            new_clips.append(clip)
+        if clip_id in seen_clips:
+            continue
 
-    # Os clips são enviados do mais antigo para o mais recente.
+        new_clips.append(clip)
+
+    # Mais antigos primeiro
     new_clips.sort(
-        key=lambda clip: clip.get("created_at", "")
+        key=lambda clip: parse_datetime(clip["created_at"])
     )
+
+    print(f"🆕 Clips novos encontrados: {len(new_clips)}")
 
     notifications_sent = 0
 
     for clip in new_clips:
+
         clip_id = clip["id"]
 
         print(
-            f"Novo clip encontrado: "
-            f"{clip.get('title', 'Sem título')}"
+            f"🎬 Novo clip: {clip.get('title', 'Sem título')}"
         )
 
-        send_clip_notification(clip)
+        payload = create_clip_payload(clip)
 
-        seen.add(clip_id)
-        notifications_sent += 1
+        try:
+            send_discord(
+                DISCORD_CLIP_WEBHOOK_URL,
+                payload
+            )
 
-    save_seen_clips(seen)
+            # Só marcamos como visto DEPOIS de enviar com sucesso.
+            seen_clips.add(clip_id)
 
-    send_status(
-        clips_checked=len(clips),
-        new_clips=len(new_clips),
-        notifications_sent=notifications_sent
-    )
+            notifications_sent += 1
 
-    print()
-    print("CHECK CONCLUÍDO")
-    print(f"Clips analisados: {len(clips)}")
-    print(f"Clips novos: {len(new_clips)}")
+            print("   ✅ Enviado para Discord.")
+
+            # Pequena pausa para evitar vários pedidos seguidos.
+            time.sleep(1)
+
+        except Exception as error:
+
+            print(
+                f"   ❌ Não foi possível enviar o clip {clip_id}: {error}"
+            )
+
+            # Não adicionamos ao seen_clips.
+            # Assim será tentado novamente na próxima execução.
+
+    state["seen_clips"] = list(seen_clips)
+
+    # Mantém apenas os últimos 5000 IDs para não deixar o ficheiro crescer
+    # indefinidamente.
+    if len(state["seen_clips"]) > 5000:
+
+        state["seen_clips"] = state["seen_clips"][-5000:]
+
+    save_state(state)
+
+    print("=" * 60)
     print(
-        f"Notificações enviadas: {notifications_sent}"
+        f"📊 Resultado: {notifications_sent} notificações enviadas."
     )
+    print("=" * 60)
 
 
 if __name__ == "__main__":
@@ -443,22 +412,11 @@ if __name__ == "__main__":
         main()
 
     except Exception as error:
-        print()
-        print("ERRO:")
-        print(error)
-        print()
 
-        try:
-            send_status(
-                clips_checked=0,
-                new_clips=0,
-                notifications_sent=0,
-                error=error
-            )
-        except Exception as discord_error:
-            print(
-                f"Também não foi possível enviar "
-                f"o erro para o Discord: {discord_error}"
-            )
+        print("=" * 60)
+        print("❌ CHECK FALHOU")
+        print("=" * 60)
+
+        print(str(error))
 
         sys.exit(1)
