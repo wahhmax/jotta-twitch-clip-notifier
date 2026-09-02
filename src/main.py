@@ -27,7 +27,7 @@ STATE_FILE = "data/state.json"
 SEARCH_WINDOW_HOURS = 24
 
 # Depois, dentro desses clips, só enviamos os que foram
-# criados nos últimos 10 minutos.
+# criados nos últimos 15 minutos.
 RECENT_WINDOW_MINUTES = 15
 
 # Número máximo de páginas.
@@ -300,6 +300,147 @@ def get_last_24h_clips(
 # DISCORD
 # ============================================================
 
+def send_interval_message(
+    start_time,
+    end_time,
+    clip_count
+):
+
+    if not DISCORD_WEBHOOK:
+
+        raise RuntimeError(
+            "DISCORD_CLIP_WEBHOOK_URL "
+            "não está configurado."
+        )
+
+    payload = {
+
+        "username":
+            "JOTTA Clip Watcher",
+
+        "content":
+            (
+                "🕐 **JOTTA Clip Watcher**\n\n"
+
+                f"Clips entre "
+                f"**{start_time.strftime('%H:%M:%S')}** "
+                f"e "
+                f"**{end_time.strftime('%H:%M:%S')} UTC**\n\n"
+
+                f"🎯 **{clip_count} "
+                f"clips novos detetados**"
+            )
+    }
+
+    print(
+        "📨 A enviar mensagem de intervalo para Discord..."
+    )
+
+    for attempt in range(
+        1,
+        6
+    ):
+
+        response = requests.post(
+            DISCORD_WEBHOOK,
+            json=payload,
+            timeout=30
+        )
+
+        print(
+            f"📡 Discord intervalo: "
+            f"HTTP {response.status_code}"
+        )
+
+        if response.status_code in (
+            200,
+            204
+        ):
+
+            print(
+                "✅ Mensagem de intervalo enviada."
+            )
+
+            return True
+
+        # Rate limit
+        if response.status_code == 429:
+
+            retry_after = None
+
+            try:
+
+                body = response.json()
+
+                retry_after = body.get(
+                    "retry_after"
+                )
+
+            except Exception:
+                pass
+
+            if retry_after is None:
+
+                retry_after = 2 ** attempt
+
+            retry_after = (
+                float(retry_after)
+                + 0.5
+            )
+
+            print(
+                "⚠️ Discord rate limit no intervalo."
+            )
+
+            print(
+                f"⏳ A aguardar "
+                f"{retry_after:.1f}s..."
+            )
+
+            time.sleep(
+                retry_after
+            )
+
+            continue
+
+        # Erro temporário
+        if response.status_code >= 500:
+
+            wait = min(
+                2 ** attempt,
+                30
+            )
+
+            print(
+                f"⚠️ Discord HTTP "
+                f"{response.status_code}"
+            )
+
+            print(
+                f"⏳ A aguardar {wait}s..."
+            )
+
+            time.sleep(
+                wait
+            )
+
+            continue
+
+        print(
+            f"❌ Discord respondeu: "
+            f"{response.text}"
+        )
+
+        return False
+
+    print(
+        "❌ Não foi possível enviar "
+        "a mensagem de intervalo."
+    )
+
+    return False
+
+
 def send_to_discord(
     clip
 ):
@@ -433,7 +574,7 @@ def send_to_discord(
             )
 
             print(
-                f"⚠️ Discord rate limit."
+                "⚠️ Discord rate limit."
             )
 
             print(
@@ -652,7 +793,7 @@ def main():
 
             continue
 
-        # Mais antigo que os últimos 10 minutos
+        # Mais antigo que a janela recente
         if created_at < recent_cutoff:
 
             print(
@@ -687,6 +828,16 @@ def main():
         f"🆕 Clips novos nos últimos "
         f"{RECENT_WINDOW_MINUTES} minutos: "
         f"{len(new_clips)}"
+    )
+
+    # --------------------------------------------------------
+    # Mensagem de intervalo
+    # --------------------------------------------------------
+
+    send_interval_message(
+        recent_cutoff,
+        now,
+        len(new_clips)
     )
 
     # --------------------------------------------------------
