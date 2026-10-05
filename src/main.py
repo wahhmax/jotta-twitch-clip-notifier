@@ -20,7 +20,6 @@ CLIENT_ID = os.getenv("TWITCH_CLIENT_ID")
 CLIENT_SECRET = os.getenv("TWITCH_CLIENT_SECRET")
 
 DISCORD_WEBHOOK = os.getenv("DISCORD_CLIP_WEBHOOK_URL")
-KICK_WEBHOOK = os.getenv("DISCORD_KICK_CLIP_WEBHOOK_URL")
 
 STATE_FILE = "data/state.json"
 
@@ -291,52 +290,6 @@ def get_last_24h_clips(
     return all_clips
 
 
-def get_kick_clips():
-    """Endpoint do site da Kick; não faz parte da API pública oficial."""
-    clips = []
-    ids = set()
-    cursor = None
-    cursors = set()
-    for _ in range(MAX_PAGES):
-        params = {"sort": "date", "time": "day"}
-        if cursor:
-            params["cursor"] = cursor
-        response = requests.get(
-            f"https://kick.com/api/v2/channels/{CHANNEL}/clips",
-            params=params,
-            headers={"Accept": "application/json"},
-            timeout=30,
-        )
-        if response.status_code != 200:
-            raise RuntimeError(
-                f"Kick: HTTP {response.status_code}. O endpoint pode estar indisponível "
-                "ou a bloquear pedidos automáticos."
-            )
-        data = response.json()
-        if not isinstance(data, dict) or not isinstance(data.get("clips"), list):
-            raise RuntimeError("Kick: formato inesperado na resposta de clips.")
-        for clip in data["clips"]:
-            clip_id = str(clip["id"])
-            if clip_id in ids:
-                continue
-            ids.add(clip_id)
-            clips.append({
-                "id": clip_id,
-                "title": clip.get("title") or "Novo clip",
-                "url": f"https://kick.com/{CHANNEL}?clip={clip_id}",
-                "creator_name": (clip.get("creator") or {}).get("username", "Desconhecido"),
-                "view_count": clip.get("view_count", clip.get("views", 0)),
-                "created_at": clip["created_at"],
-            })
-        cursor = data.get("nextCursor") or data.get("next_cursor")
-        if not cursor:
-            return clips
-        if cursor in cursors:
-            raise RuntimeError("Kick: cursor de paginação repetido.")
-        cursors.add(cursor)
-    raise RuntimeError("Kick: limite de páginas atingido; pesquisa incompleta.")
-
-
 def discord_post(webhook, payload):
     payload["allowed_mentions"] = {"parse": []}
     for attempt in range(1, 6):
@@ -354,7 +307,7 @@ def discord_post(webhook, payload):
                 delay = float(response.json().get("retry_after", 2 ** attempt)) + 0.5
             except (ValueError, TypeError, AttributeError):
                 delay = 2 ** attempt
-            # Não bloquear indefinidamente a outra plataforma.
+            # Limitar o tempo de espera quando o Discord impõe um limite.
             if delay > 60:
                 return False
         elif response.status_code >= 500:
@@ -366,32 +319,32 @@ def discord_post(webhook, payload):
     return False
 
 
-def send_interval_message(start_time, end_time, clip_count, webhook, platform):
-    return discord_post(webhook, {
-        "username": f"JOTTA {platform} Clip Watcher",
+def send_interval_message(start_time, end_time, clip_count):
+    return discord_post(DISCORD_WEBHOOK, {
+        "username": "JOTTA Twitch Clip Watcher",
         "content": (
-            f"🕐 **JOTTA {platform} Clip Watcher**\n\n"
+            "🕐 **JOTTA Twitch Clip Watcher**\n\n"
             f"Clips entre **{start_time:%H:%M:%S}** e **{end_time:%H:%M:%S} UTC**\n\n"
             f"🎯 **{clip_count} clips novos detetados**"
         ),
     })
 
 
-def send_to_discord(clip, webhook, platform):
-    return discord_post(webhook, {
-        "username": f"JOTTA {platform} Clip Watcher",
-        "content": f"🎬 **NOVO CLIP DO JOTTA — {platform.upper()}**",
+def send_to_discord(clip):
+    return discord_post(DISCORD_WEBHOOK, {
+        "username": "JOTTA Twitch Clip Watcher",
+        "content": "🎬 **NOVO CLIP DO JOTTA | TWITCH**",
         "embeds": [{
             "title": (clip.get("title") or "Novo clip")[:256],
             "url": clip["url"],
-            "color": 0x53FC18 if platform == "Kick" else 0x9146FF,
+            "color": 0x9146FF,
             "description": (
                 f"📺 **Streamer:** {CHANNEL}\n\n"
                 f"✂️ **Criado por:** {clip.get('creator_name', 'Desconhecido')}\n\n"
                 f"👁️ **Visualizações:** {clip.get('view_count', 0)}\n\n"
                 f"🕐 **Publicado:** {clip['created_at']}"
             ),
-            "footer": {"text": f"JOTTA {platform} Clip Watcher"},
+            "footer": {"text": "JOTTA Twitch Clip Watcher"},
         }],
     })
 
@@ -403,57 +356,46 @@ def get_twitch_clips():
     return get_last_24h_clips(token, get_channel_id(token))
 
 
-def process_platform(platform, webhook, state_key, fetch_clips, state):
+def process_twitch_clips(state):
     now = now_utc()
     cutoff = now - timedelta(minutes=RECENT_WINDOW_MINUTES)
-    history = state.setdefault(state_key, [])
+    # Manter a chave original evita reenviar clips já publicados.
+    history = state.setdefault("seen_clips", [])
     seen = set(history)
     new_clips = {}
-    for clip in fetch_clips():
+    for clip in get_twitch_clips():
         created_at = parse_time(clip["created_at"])
         if clip["id"] not in seen and cutoff <= created_at <= now:
             new_clips[clip["id"]] = clip
     clips = sorted(new_clips.values(), key=lambda clip: parse_time(clip["created_at"]))
-    print(f"{platform}: {len(clips)} clips novos nos últimos {RECENT_WINDOW_MINUTES} minutos.")
-    successful = send_interval_message(cutoff, now, len(clips), webhook, platform)
+    print(f"Twitch: {len(clips)} clips novos nos últimos {RECENT_WINDOW_MINUTES} minutos.")
+    successful = send_interval_message(cutoff, now, len(clips))
     for clip in clips:
-        if send_to_discord(clip, webhook, platform):
+        if send_to_discord(clip):
             history.append(clip["id"])
-            state[state_key] = history[-5000:]
+            state["seen_clips"] = history[-5000:]
             # Guardar cada envio confirmado, mesmo se o seguinte falhar.
             save_state(state)
         else:
             successful = False
         time.sleep(1)
     if not successful:
-        raise RuntimeError(f"{platform}: um ou mais envios para o Discord falharam.")
+        raise RuntimeError("Twitch: um ou mais envios para o Discord falharam.")
 
 
 def main():
     state = load_state()
-    failures = []
-    # Manter a chave antiga da Twitch evita reenviar o histórico existente.
-    platforms = [
-        ("Twitch", DISCORD_WEBHOOK, "seen_clips", get_twitch_clips),
-        ("Kick", KICK_WEBHOOK, "kick_seen_clips", get_kick_clips),
-    ]
-    for platform, webhook, state_key, fetch_clips in platforms:
-        if platform == "Kick" and not webhook:
-            print("Kick desativada: configura DISCORD_KICK_CLIP_WEBHOOK_URL para ativar.")
-            continue
-        try:
-            if not webhook:
-                raise RuntimeError("DISCORD_CLIP_WEBHOOK_URL não configurado.")
-            process_platform(platform, webhook, state_key, fetch_clips, state)
-        except Exception as error:
-            # HTTP exceptions podem incluir URLs secretos; só expor erros controlados.
-            detail = str(error) if isinstance(error, RuntimeError) else type(error).__name__
-            print(f"{platform}: falhou — {detail}")
-            failures.append(platform)
-        finally:
-            save_state(state)
-    if failures:
-        raise RuntimeError("Falha nas plataformas: " + ", ".join(failures))
+    try:
+        if not DISCORD_WEBHOOK:
+            raise RuntimeError("DISCORD_CLIP_WEBHOOK_URL não configurado.")
+        process_twitch_clips(state)
+    except Exception as error:
+        # HTTP exceptions podem incluir URLs secretos; só expor erros controlados.
+        detail = str(error) if isinstance(error, RuntimeError) else type(error).__name__
+        print(f"Twitch: falhou: {detail}")
+        raise
+    finally:
+        save_state(state)
 
 
 if __name__ == "__main__":
@@ -462,5 +404,4 @@ if __name__ == "__main__":
     except Exception as error:
         print(f"CHECK FALHOU: {type(error).__name__}")
         sys.exit(1)
-
 
